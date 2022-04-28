@@ -118,7 +118,7 @@ while True:
                         #if the it's successful close the connection
                         try:
                             s.create_connection((primary_dc_ip_address,PROBE_PORT),TIMEOUT,(local_eni_ip_address, 0))
-                            need_swap = True if current_ip == secondary_eni_ip_address else False
+                            #need_swap = True if current_ip == secondary_eni_ip_address else False
                         except socket.error as e:
                             logger.info("Error probing on-premise FW {} port {} using source IP {},{}".format(
                                 primary_dc_ip_address,PROBE_PORT,local_eni_ip_address,e))
