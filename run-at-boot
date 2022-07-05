@@ -1,12 +1,14 @@
 #!/usr/bin/python
-import boto3, time, requests, socket, os, sys
+import boto3, time, requests, socket, os, sys, logging, platform, subprocess
 import botocore.exceptions
 
-from sg.waagent.logger import NGFwLogger
-from azurelinuxagent.common import logger
+#from sg.waagent.logging import NGFwLogger
+#from azurelinuxagent.common import logging
 
-LOGFILE = "/data/diagnostics/awsha-{}.log".format(os.getpid())
-logger.DEFAULT_LOGGER = NGFwLogger(LOGFILE)
+#LOGFILE = "/data/diagnostics/awsha-{}.log".format(os.getpid())
+#logging.DEFAULT_LOGGER = NGFwLogger(LOGFILE)
+
+logging.basicConfig(filename="/data/diagnostics/awsha-{}.log".format(os.getpid()), level=logging.INFO)
 
 ROUTE_TABLE_FILE="/data/route-tables"
 PROBE_PORT=22
@@ -18,15 +20,35 @@ OPENSSL_CACERT_FILE = "/data/config/policy/latest/inspection/ca-bundle.pem"
 if not os.path.exists(OPENSSL_CACERT_FILE):
     OPENSSL_CACERT_FILE = "/data/config/tls/ca-bundle.pem"
     assert os.path.exists(OPENSSL_CACERT_FILE)
-logger.info("PEM bundle found: {}".format(OPENSSL_CACERT_FILE))
+logging.info("PEM bundle found: {}".format(OPENSSL_CACERT_FILE))
+
+def getMetadatatoken():
+    headers = {"X-aws-ec2-metadata-token-ttl-seconds": "300"}
+    return requests.put("{}/{}".format(EC2_METADATA_URL_BASE, "api/token"), headers=headers).text
 
 def getMetadata(url):
-    r = requests.get(url)
+    token = getMetadatatoken()
+    headers = {"X-aws-ec2-metadata-token": token}
+    # r = requests.get(url)
     #Metadata service returns plaintext here
-    return requests.get(url).text
+    return requests.get(url, headers=headers).text
 
 def getMetadataValue(key):
     return getMetadata("{}/{}".format(EC2_METADATA_URL,key))
+
+def ping(host, src):
+    """
+    Returns True if host (str) responds to a ping request.
+    Remember that a host may not respond to a ping (ICMP) request even if the host name is valid.
+    """
+
+    # Option for the number of packets as a function of
+    param = '-n' if platform.system().lower()=='windows' else '-c'
+
+    # Building the command. Ex: "ping -c 1 google.com"
+    command = ['ping', param, '2', host, '-I', src]
+
+    return subprocess.call(command, stdout=open(os.devnull, 'wb')) == 0
 
 os.environ['REQUESTS_CA_BUNDLE'] = OPENSSL_CACERT_FILE
 ec2 = boto3.resource('ec2', region_name='eu-west-3',api_version='2016-09-15')
@@ -47,7 +69,7 @@ local_eni_id = None
 local_eni_ip_address = None # Stash current private IP of this host.
 
 primary_eni_ip_address = "10.119.0.4"
-primari_eni = ec2_client.describe_network_interfaces(
+primary_eni = ec2_client.describe_network_interfaces(
     Filters=[
         {
             'Name': 'addresses.private-ip-address',
@@ -55,7 +77,7 @@ primari_eni = ec2_client.describe_network_interfaces(
         }
     ]
 )
-primary_eni_id = primari_eni['NetworkInterfaceId']
+primary_eni_id = primary_eni['NetworkInterfaces'][0]['NetworkInterfaceId']
 
 secondary_eni_ip_address = "10.119.0.20"
 secondary_eni = ec2_client.describe_network_interfaces(
@@ -66,9 +88,9 @@ secondary_eni = ec2_client.describe_network_interfaces(
         }
     ]
 )
-secondary_eni_id = secondary_eni['NetworkInterfaceId']
+secondary_eni_id = secondary_eni['NetworkInterfaces'][0]['NetworkInterfaceId']
 
-primary_dc_ip_address = "10.21.52.13"
+primary_dc_ip_address =  "10.29.28.33" #"10.21.52.13"
 
 
 # Assume the local_eni is DeviceIndex 0 if there is only 1 interface
@@ -76,13 +98,13 @@ primary_dc_ip_address = "10.21.52.13"
 # TODO this is a temporary fix, this should really come from a conf file
 # or something
 for interface in instance.network_interfaces_attribute:
-    #WAN interface index = 0
-    if interface['Attachment']['DeviceIndex'] == 0:
+    #LAN interface index = 1
+    if interface['Attachment']['DeviceIndex'] == 1:
         local_eni_id = interface['NetworkInterfaceId']
         local_eni_ip_address = interface['PrivateIpAddress']
 
-logger.info("Local WAN (facing DC) eni is {} : IP {}".format(local_eni_id, local_eni_ip_address))
-logger.info('Watching {}'.format(route_tables))
+logging.info("Local WAN (facing DC) eni is {} : IP {}".format(local_eni_id, local_eni_ip_address))
+logging.info('Watching {}'.format(route_tables))
 
 while True:
     time.sleep(1)
@@ -92,17 +114,20 @@ while True:
         table.reload()
         for route in table.routes_attribute:
             need_swap = False
+            need_failover = False
             if 'NetworkInterfaceId' not in route.keys():
                 continue #route not going to NGFW, skipping
             remote_eni = ec2.NetworkInterface(route['NetworkInterfaceId'])
             try:
                 current_ip = remote_eni.private_ip_address
+                # determine if the current routing is via the primary or the backup tunnel
+                is_routing_via_primary = current_ip == primary_eni_ip_address
+                is_routing_via_secondary = current_ip == secondary_eni_ip_address
                 if route['State'] == 'blackhole':
                     #do not even test route as it is detected as broken by platform
-                    logger.info('AWS detected {} as blackhole'.format(remote_eni))
-                    need_swap = True
-                # elif current_ip == local_eni_ip_address:
-                #     pass # Skipping probe, we are the current route eni gateway
+                    logging.info('AWS detected {} as blackhole'.format(remote_eni))
+                    need_swap = is_routing_via_secondary
+                    need_failover = is_routing_via_primary
                 else:
                     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                     s.settimeout(TIMEOUT)
@@ -110,35 +135,42 @@ while True:
                         s.connect((primary_eni_ip_address,PROBE_PORT))
                         #need_swap = True if current_ip == secondary_eni_ip_address else False
                     except socket.error as e:
-                        logger.info("Error probing local ENI {} port {},{}".format(
+                        logging.info("Error probing local ENI {} port {},{}".format(
                             primary_eni_ip_address,PROBE_PORT,e))
-                        need_swap = True
-                    if not need_swap:
+                        need_failover = is_routing_via_primary
+                    if not need_failover:
                         #check the connectivity over the tunnel
                         #if the it's successful close the connection
+                        # try:
+                        #     socket.create_connection((primary_dc_ip_address,PROBE_PORT),TIMEOUT,(local_eni_ip_address, 0))
+                        #     need_swap = is_routing_via_secondary
+                        # except socket.error as e:
+                        #     logging.info("Error probing on-premise FW {} port {} using source IP {},{}".format(
+                        #         primary_dc_ip_address,PROBE_PORT,local_eni_ip_address,e))
+                        #     need_failover = is_routing_via_primary
                         try:
-                            s.create_connection((primary_dc_ip_address,PROBE_PORT),TIMEOUT,(local_eni_ip_address, 0))
-                            #need_swap = True if current_ip == secondary_eni_ip_address else False
-                        except socket.error as e:
-                            logger.info("Error probing on-premise FW {} port {} using source IP {},{}".format(
-                                primary_dc_ip_address,PROBE_PORT,local_eni_ip_address,e))
-                            need_swap = True
-                        if not need_swap:
+                            ping(primary_dc_ip_address, local_eni_ip_address)
+                            need_swap = is_routing_via_secondary
+                        except:
+                            logging.info("Error probing on-premise FW {} port {} using source IP {}".format(
+                                primary_dc_ip_address,PROBE_PORT,local_eni_ip_address))
+                            need_failover = is_routing_via_primary
+                        if not need_failover:
                             s.close
-                if need_swap:
+                if need_failover:
                     #modify target interface
                     route_obj = ec2.Route(table.id,route['DestinationCidrBlock'])
-                    logger.info('Previous route: {}'.format(route))
-                    if current_ip == primary_eni_ip_address:
-                        logger.info('Modifying route to use secondary eni {}'.format(secondary_eni_id))
-                        route_obj.replace(route['DestinationCidrBlock'],
-                            NetworkInterfaceId=secondary_eni_id)
-                        logger.info('Modifying route done')
-                    #else: secondary is blackhole is down, so keep the route on seconday, nothing to do.
-                    if current_ip == secondary_eni_ip_address:
-                        logger.info('Modifying route back to use primary eni {}'.format(primary_eni_id))
-                        route_obj.replace(route['DestinationCidrBlock'],
-                            NetworkInterfaceId=primary_eni_id)
-                        logger.info('Modifying route done')
+                    logging.info('Current route: {}'.format(route))
+                    logging.info('Modifying route to use secondary eni {}'.format(secondary_eni_id))
+                    route_obj.replace(route['DestinationCidrBlock'],
+                        NetworkInterfaceId=secondary_eni_id)
+                    logging.info('Modifying route done')
+                elif need_swap:
+                    route_obj = ec2.Route(table.id,route['DestinationCidrBlock'])
+                    logging.info('Current route: {}'.format(route))
+                    logging.info('Modifying route back to use primary eni {}'.format(primary_eni_id))
+                    route_obj.replace(route['DestinationCidrBlock'],
+                        NetworkInterfaceId=primary_eni_id)
+                    logging.info('Modifying route done')
             except botocore.exceptions.ClientError as e:
-                logger.error(str(e))
+                logging.error(str(e))
