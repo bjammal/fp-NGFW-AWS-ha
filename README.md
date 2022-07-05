@@ -1,5 +1,7 @@
 # Forcepoint NGFW AWS High Availability
 
+Forked from Forcepoint public repo: https://github.com/Forcepoint/fp-NGFW-AWS-ha
+
 The run-at-boot script can be used with two or more forcepoint NGFW AWS
 instances to implement High Availability.
 
